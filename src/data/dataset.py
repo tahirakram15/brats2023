@@ -50,7 +50,7 @@ def build_file_list(data_dir: str) -> List[Dict[str, str]]:
 
         seg = subject_dir / f"{sid}-seg.nii.gz"
         if not seg.exists():
-            seg = subject_dir / f"{sid}seg.nii.gz"
+             seg = subject_dir / f"{sid}_seg.nii.gz"
 
         if all(Path(i).exists() for i in images) and seg.exists():
             data_list.append({"image": images, "label": str(seg)})
@@ -72,9 +72,10 @@ def build_test_file_list(test_dir: str) -> List[Dict[str, str]]:
         sid = subject_dir.name
         images = []
         for mod in cfg.modalities:
+            
             p = subject_dir / f"{sid}-{mod}.nii.gz"
             if not p.exists():
-                p = subject_dir / f"{sid}{mod}.nii.gz"
+                p = subject_dir / f"{sid}_{mod}.nii.gz"
             images.append(str(p))
 
         if all(Path(i).exists() for i in images):

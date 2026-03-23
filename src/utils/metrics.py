@@ -29,9 +29,11 @@ def build_metrics() -> Tuple[DiceMetric, HausdorffDistanceMetric, Compose]:
         hd95_metric   — MONAI HausdorffDistanceMetric at 95th percentile
         post_trans    — sigmoid → threshold(0.5) post-processing transform
     """
-    dice_metric = DiceMetric(include_background=True, reduction="mean")
+
+    # src/utils/metrics.py
+    dice_metric = DiceMetric(include_background=False, reduction="mean")
     hd95_metric = HausdorffDistanceMetric(
-        include_background=True,
+        include_background=False,
         distance_metric="euclidean",
         percentile=95,
         reduction="mean",

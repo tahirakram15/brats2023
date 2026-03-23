@@ -22,7 +22,7 @@ from monai.utils import set_determinism
 from torch.cuda.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-from config import cfg
+from src.config import cfg
 from src.data.dataset import get_train_loader, get_val_loader
 from src.losses.losses import BraTSLoss
 from src.models import build_model
