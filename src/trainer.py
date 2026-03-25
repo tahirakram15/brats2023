@@ -1,33 +1,24 @@
 """
 Trainer class for BraTS 2023.
-
-Handles the full training + validation loop:
-  - Mixed-precision (AMP) forward + backward
-  - Gradient clipping
-  - Cosine LR schedule
-  - Sliding-window validation
-  - Best-model checkpointing
-  - JSON history logging
 """
 
 import json
 import logging
 import os
+from contextlib import nullcontext
 from typing import Dict
-import numpy as np
 
+import numpy as np
 import torch
-from monai.data import decollate_batch
 from monai.inferers import sliding_window_inference
 from monai.utils import set_determinism
-from torch.cuda.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from src.config import cfg
 from src.data.dataset import get_train_loader, get_val_loader
 from src.losses.losses import BraTSLoss
 from src.models import build_model
-from src.utils import build_metrics, metrics
+from src.utils import build_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -40,210 +31,232 @@ class Trainer:
         os.makedirs(cfg.output_dir, exist_ok=True)
         os.makedirs(cfg.model_dir, exist_ok=True)
 
-        self.device = torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
-        )
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.use_amp = bool(cfg.use_amp and self.device.type == "cuda")
         logger.info("Device: %s", self.device)
+        logger.info("AMP enabled: %s", self.use_amp)
 
-        # Data
         self.train_loader = get_train_loader()
         self.val_loader = get_val_loader()
 
-        # Model + optimiser + loss
         self.model = build_model(cfg.model_name).to(self.device)
         self.loss_fn = BraTSLoss().to(self.device)
-        self.optimizer = torch.optim.Adam(
+        self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=cfg.learning_rate,
             weight_decay=cfg.weight_decay,
         )
         self.scheduler = CosineAnnealingLR(
-            self.optimizer, T_max=cfg.max_epochs, eta_min=1e-6
+            self.optimizer,
+            T_max=cfg.max_epochs,
+            eta_min=1e-6,
         )
-        self.scaler = GradScaler()
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
 
-        # Metrics
-        self.dice_metric, self.hd95_metric, self.post_trans = build_metrics()
+        (
+            self.dice_mean_metric,
+            self.dice_batch_metric,
+            self.hd95_batch_metric,
+            self.post_trans,
+        ) = build_metrics()
 
-        self.best_mean_dice = 0.0
-        self.history: Dict = {"train_loss": [], "val_dice": []}
+        self.best_mean_dice = -float("inf")
+        self.history: Dict[str, list] = {
+            "train_loss": [],
+            "val_loss": [],
+            "val_mean_dice": [],
+            "val_dice_tc": [],
+            "val_dice_wt": [],
+            "val_dice_et": [],
+            "val_hd95_tc": [],
+            "val_hd95_wt": [],
+            "val_hd95_et": [],
+            "lr": [],
+        }
 
-    # ─────────────────────────────────────────────────────────────────────
+    def _amp_autocast(self):
+        if self.use_amp:
+            return torch.cuda.amp.autocast()
+        return nullcontext()
+
     def _train_epoch(self, epoch: int) -> float:
         self.model.train()
-        epoch_loss, step = 0.0, 0
+        epoch_loss = 0.0
+        num_steps = 0
 
-        for batch in self.train_loader:
-            images = batch["image"].to(self.device)
-            labels = batch["label"].to(self.device)
+        for step, batch in enumerate(self.train_loader, start=1):
+            images = batch["image"].to(self.device, non_blocking=True)
+            labels = batch["label"].to(self.device, non_blocking=True)
 
             self.optimizer.zero_grad(set_to_none=True)
-            with autocast():
+            with self._amp_autocast():
                 outputs = self.model(images)
                 loss = self.loss_fn(outputs, labels)
 
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), cfg.grad_clip_norm)
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
-            epoch_loss += loss.item()
-            step += 1
+            epoch_loss += float(loss.item())
+            num_steps = step
 
-        return epoch_loss / max(step, 1)
+        return epoch_loss / max(num_steps, 1)
 
-    def _validate(self):
-   
+    def _validate(self) -> Dict[str, float]:
         self.model.eval()
-        self.dice_metric.reset()
+        self.dice_mean_metric.reset()
+        self.dice_batch_metric.reset()
+        self.hd95_batch_metric.reset()
 
         val_loss = 0.0
         num_batches = 0
 
         with torch.no_grad():
             for batch in self.val_loader:
-                images = batch["image"].to(self.device)
-                labels = batch["label"].to(self.device)
+                images = batch["image"].to(self.device, non_blocking=True)
+                labels = batch["label"].to(self.device, non_blocking=True)
 
-                # forward
-                outputs = self.model(images)
+                with self._amp_autocast():
+                    logits = sliding_window_inference(
+                        inputs=images,
+                        roi_size=cfg.roi_size,
+                        sw_batch_size=cfg.sw_batch_size,
+                        predictor=self.model,
+                        overlap=cfg.overlap,
+                    )
+                    loss = self.loss_fn(logits, labels)
 
-                # loss
-                loss = self.loss_fn(outputs, labels)
-                val_loss += loss.item()
+                preds = self.post_trans(logits)
+                labels_for_metric = labels.float()
+
+                self.dice_mean_metric(y_pred=preds, y=labels_for_metric)
+                self.dice_batch_metric(y_pred=preds, y=labels_for_metric)
+                self.hd95_batch_metric(y_pred=preds, y=labels_for_metric)
+
+                val_loss += float(loss.item())
                 num_batches += 1
 
-                # BraTS here is multilabel region prediction, so use sigmoid
-                probs = torch.sigmoid(outputs)
-                preds = (probs > 0.5).float()
-
-            # update MONAI dice metric
-                self.dice_metric(y_pred=preds, y=labels)
-
-    # mean validation loss
         mean_val_loss = val_loss / max(1, num_batches)
 
-            # aggregate mean dice
-        dice_mean = self.dice_metric.aggregate()
-        if isinstance(dice_mean, torch.Tensor):
-            dice_mean = float(dice_mean.detach().cpu().item())
+        mean_dice = self.dice_mean_metric.aggregate()
+        if isinstance(mean_dice, torch.Tensor):
+            mean_dice = float(mean_dice.detach().cpu().item())
         else:
-            dice_mean = float(dice_mean)
+            mean_dice = float(mean_dice)
 
-        # aggregate per-region dice safely
-        per_region = self.dice_metric.aggregate(reduction=None)
+        per_region_dice = self.dice_batch_metric.aggregate()
+        per_region_hd95 = self.hd95_batch_metric.aggregate()
 
-        if isinstance(per_region, torch.Tensor):
-            per_region = per_region.detach().cpu().numpy()
+        if isinstance(per_region_dice, torch.Tensor):
+            per_region_dice = per_region_dice.detach().cpu().numpy()
         else:
-            per_region = np.asarray(per_region)
+            per_region_dice = np.asarray(per_region_dice)
 
-        # Robust handling for different MONAI output shapes
-        # Possible cases:
-        # scalar
-        # (3,)
-        # (N,3)
-        # (1,3)
-        # weird flattened forms
-        if per_region.ndim == 0:
-            per_region = np.array([float(per_region)] * 3, dtype=np.float32)
-
-        elif per_region.ndim == 1:
-            if per_region.shape[0] == 1:
-                per_region = np.array([float(per_region[0])] * 3, dtype=np.float32)
-            elif per_region.shape[0] < 3:
-                padded = np.zeros(3, dtype=np.float32)
-                padded[:per_region.shape[0]] = per_region
-                per_region = padded
-            else:
-                per_region = per_region[:3].astype(np.float32)
-
+        if isinstance(per_region_hd95, torch.Tensor):
+            per_region_hd95 = per_region_hd95.detach().cpu().numpy()
         else:
-            # e.g. (num_cases, 3) or (1, 3)
-            per_region = np.asarray(per_region, dtype=np.float32)
-            per_region = per_region.reshape(-1, per_region.shape[-1]).mean(axis=0)
+            per_region_hd95 = np.asarray(per_region_hd95)
 
-            if per_region.shape[0] < 3:
-                padded = np.zeros(3, dtype=np.float32)
-                padded[:per_region.shape[0]] = per_region
-                per_region = padded
-            else:
-                per_region = per_region[:3].astype(np.float32)
+        per_region_dice = np.nan_to_num(per_region_dice.astype(np.float32), nan=0.0)
+        per_region_hd95 = np.nan_to_num(per_region_hd95.astype(np.float32), nan=0.0, posinf=0.0)
 
         metrics = {
             "val_loss": float(mean_val_loss),
-            "dice": float(dice_mean),
-            "dice_tc": float(per_region[0]),
-            "dice_wt": float(per_region[1]),
-            "dice_et": float(per_region[2]),
+            "mean_dice": float(mean_dice),
+            "dice_tc": float(per_region_dice[0]),
+            "dice_wt": float(per_region_dice[1]),
+            "dice_et": float(per_region_dice[2]),
+            "hd95_tc": float(per_region_hd95[0]),
+            "hd95_wt": float(per_region_hd95[1]),
+            "hd95_et": float(per_region_hd95[2]),
+            "hd95_mean": float(np.mean(per_region_hd95)),
         }
 
-        self.dice_metric.reset()
+        self.dice_mean_metric.reset()
+        self.dice_batch_metric.reset()
+        self.hd95_batch_metric.reset()
         self.model.train()
-
         return metrics
 
-    # ─────────────────────────────────────────────────────────────────────
-
-    # ─────────────────────────────────────────────────────────────────────
-    def _save_checkpoint(self, epoch: int, metrics: Dict):
+    def _save_checkpoint(self, epoch: int, metrics: Dict[str, float]) -> None:
         path = os.path.join(cfg.model_dir, "best_model.pth")
         torch.save(
             {
                 "epoch": epoch,
                 "model_state_dict": self.model.state_dict(),
                 "optimizer_state_dict": self.optimizer.state_dict(),
+                "scheduler_state_dict": self.scheduler.state_dict(),
                 "best_mean_dice": self.best_mean_dice,
                 "metrics": metrics,
                 "config": cfg.__dict__,
             },
             path,
         )
-        logger.info("Checkpoint saved → %s", path)
+        logger.info("Checkpoint saved -> %s", path)
 
-    # ─────────────────────────────────────────────────────────────────────
-    def train(self):
-        logger.info("Training for %d epochs …", cfg.max_epochs)
+    def train(self) -> None:
+        logger.info("Training for %d epochs ...", cfg.max_epochs)
 
         for epoch in range(1, cfg.max_epochs + 1):
-            loss = self._train_epoch(epoch)
+            train_loss = self._train_epoch(epoch)
             self.scheduler.step()
-            self.history["train_loss"].append(loss)
+            current_lr = float(self.optimizer.param_groups[0]["lr"])
+
+            self.history["train_loss"].append(train_loss)
+            self.history["lr"].append(current_lr)
 
             if epoch % cfg.val_every == 0:
                 m = self._validate()
-                self.history["val_dice"].append(m["mean_dice"])
+                self.history["val_loss"].append(m["val_loss"])
+                self.history["val_mean_dice"].append(m["mean_dice"])
+                self.history["val_dice_tc"].append(m["dice_tc"])
+                self.history["val_dice_wt"].append(m["dice_wt"])
+                self.history["val_dice_et"].append(m["dice_et"])
+                self.history["val_hd95_tc"].append(m["hd95_tc"])
+                self.history["val_hd95_wt"].append(m["hd95_wt"])
+                self.history["val_hd95_et"].append(m["hd95_et"])
+
                 logger.info(
-                    "Epoch %4d/%d | Loss %.4f | "
-                    "Dice TC/WT/ET %.4f/%.4f/%.4f | HD95 %.2f",
+                    (
+                        "Epoch %4d/%d | train_loss %.4f | val_loss %.4f | "
+                        "Dice mean/TC/WT/ET %.4f/%.4f/%.4f/%.4f | "
+                        "HD95 mean/TC/WT/ET %.4f/%.4f/%.4f/%.4f | lr %.2e"
+                    ),
                     epoch,
                     cfg.max_epochs,
-                    loss,
+                    train_loss,
+                    m["val_loss"],
+                    m["mean_dice"],
                     m["dice_tc"],
                     m["dice_wt"],
                     m["dice_et"],
-                    m["hd95"],
+                    m["hd95_mean"],
+                    m["hd95_tc"],
+                    m["hd95_wt"],
+                    m["hd95_et"],
+                    current_lr,
                 )
+
                 if m["mean_dice"] > self.best_mean_dice:
                     self.best_mean_dice = m["mean_dice"]
                     self._save_checkpoint(epoch, m)
-                    logger.info(
-                        "  ↳ New best mean Dice: %.4f", self.best_mean_dice
-                    )
+                    logger.info("New best mean Dice: %.4f", self.best_mean_dice)
             else:
                 logger.info(
-                    "Epoch %4d/%d | Loss %.4f", epoch, cfg.max_epochs, loss
+                    "Epoch %4d/%d | train_loss %.4f | lr %.2e",
+                    epoch,
+                    cfg.max_epochs,
+                    train_loss,
+                    current_lr,
                 )
 
-        # Save final weights and training history
         torch.save(
             self.model.state_dict(),
             os.path.join(cfg.model_dir, "final_model.pth"),
         )
-        with open(os.path.join(cfg.output_dir, "history.json"), "w") as f:
+        with open(os.path.join(cfg.output_dir, "history.json"), "w", encoding="utf-8") as f:
             json.dump(self.history, f, indent=2)
 
-        logger.info(
-            "Training complete. Best mean Dice: %.4f", self.best_mean_dice
-        )
+        logger.info("Training complete. Best mean Dice: %.4f", self.best_mean_dice)

@@ -1,329 +1,195 @@
-from __future__ import annotations
+"""
+Dataset utilities for BraTS 2023.
+"""
 
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Tuple
 
-import torch
-from monai.data import DataLoader, Dataset
-from monai.transforms import (
-    Compose,
-    DivisiblePadd,
-    EnsureChannelFirstd,
-    EnsureTyped,
-    Lambdad,
-    LoadImaged,
-    NormalizeIntensityd,
-    Orientationd,
-    RandFlipd,
-    RandScaleIntensityd,
-    RandShiftIntensityd,
-    RandSpatialCropd,
-)
+import numpy as np
+from monai.data import CacheDataset, DataLoader, Dataset
 
 from src.config import cfg
-
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+from src.data.transforms import (
+    get_inference_transforms,
+    get_train_transforms,
+    get_val_transforms,
 )
+
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------
-
-MODALITIES: Sequence[str] = ("t1c", "t1n", "t2f", "t2w")
-
-
-def _get_cfg_value(name: str, default):
-    return getattr(cfg, name, default)
-
-
-def _get_roi_size() -> Tuple[int, int, int]:
-    roi = _get_cfg_value("roi_size", (128, 128, 128))
-    if isinstance(roi, (list, tuple)) and len(roi) == 3:
-        return tuple(int(x) for x in roi)
-    return (128, 128, 128)
-
-
-def _get_num_workers() -> int:
-    return int(_get_cfg_value("num_workers", 2))
-
-
-def _get_batch_size() -> int:
-    return int(_get_cfg_value("batch_size", 1))
-
-
-def _get_val_ratio() -> float:
-    return float(_get_cfg_value("val_ratio", 0.2))
-
-
-def _get_divisible_k() -> int:
-    # 16 is safer than 8 for common 3D UNet / SegResNet depth settings.
-    return int(_get_cfg_value("divisible_k", 16))
-
-
-def _find_existing(candidates: Sequence[Path]) -> Optional[Path]:
-    for p in candidates:
-        if p.exists():
-            return p
+def _first_existing(paths: List[Path]) -> Path | None:
+    for path in paths:
+        if path.exists():
+            return path
     return None
 
 
-def _modality_candidates(subject_dir: Path, sid: str, mod: str) -> List[Path]:
-    return [
-        subject_dir / f"{sid}-{mod}.nii.gz",
-        subject_dir / f"{sid}_{mod}.nii.gz",
-        subject_dir / f"{mod}.nii.gz",
+def _resolve_modality_path(subject_dir: Path, sid: str, modality: str) -> Path | None:
+    candidates = [
+        subject_dir / f"{sid}-{modality}.nii.gz",
+        subject_dir / f"{sid}_{modality}.nii.gz",
+        subject_dir / f"{sid}{modality}.nii.gz",
     ]
+    return _first_existing(candidates)
 
 
-def _seg_candidates(subject_dir: Path, sid: str) -> List[Path]:
-    return [
+def _resolve_label_path(subject_dir: Path, sid: str) -> Path | None:
+    candidates = [
         subject_dir / f"{sid}-seg.nii.gz",
         subject_dir / f"{sid}_seg.nii.gz",
-        subject_dir / "seg.nii.gz",
+        subject_dir / f"{sid}seg.nii.gz",
     ]
+    return _first_existing(candidates)
 
 
-# ---------------------------------------------------------------------
-# Label conversion
-# ---------------------------------------------------------------------
+def build_file_list(data_dir: str) -> List[Dict[str, str]]:
+    data_dir = Path(data_dir)
+    if not data_dir.exists():
+        raise FileNotFoundError(f"Training data directory does not exist: {data_dir}")
 
-def convert_brats_labels(seg: torch.Tensor) -> torch.Tensor:
-    """
-    Convert BraTS segmentation labels:
-      0 = background
-      1 = NCR/NET
-      2 = ED
-      3 = ET
-
-    into 3 multilabel channels:
-      TC = [1, 3]
-      WT = [1, 2, 3]
-      ET = [3]
-
-    Input shape after loading:
-      [1, D, H, W]
-
-    Output shape:
-      [3, D, H, W]
-    """
-    if seg.ndim == 4 and seg.shape[0] == 1:
-        seg = seg[0]
-
-    tc = ((seg == 1) | (seg == 3)).float()
-    wt = ((seg == 1) | (seg == 2) | (seg == 3)).float()
-    et = (seg == 3).float()
-
-    out = torch.stack([tc, wt, et], dim=0)
-    return out
-
-
-# ---------------------------------------------------------------------
-# File list builders
-# ---------------------------------------------------------------------
-
-def build_file_list(data_dir: str, require_label: bool = True) -> List[Dict[str, object]]:
-    root = Path(data_dir)
-    if not root.exists():
-        raise FileNotFoundError(f"Data directory not found: {root}")
-
-    items: List[Dict[str, object]] = []
-
-    for subject_dir in sorted(root.iterdir()):
+    data_list: List[Dict[str, str]] = []
+    for subject_dir in sorted(data_dir.iterdir()):
         if not subject_dir.is_dir():
             continue
 
         sid = subject_dir.name
-
-        image_paths: List[str] = []
-        missing_modality = False
-
-        for mod in MODALITIES:
-            chosen = _find_existing(_modality_candidates(subject_dir, sid, mod))
-            if chosen is None:
-                logger.warning("Skipping %s: missing modality %s", sid, mod)
-                missing_modality = True
+        images: List[str] = []
+        missing = False
+        for modality in cfg.modalities:
+            path = _resolve_modality_path(subject_dir, sid, modality)
+            if path is None:
+                missing = True
+                logger.warning("Missing modality '%s' for subject %s", modality, sid)
                 break
-            image_paths.append(str(chosen))
+            images.append(str(path))
 
-        if missing_modality:
+        seg = _resolve_label_path(subject_dir, sid)
+        if missing or seg is None:
+            logger.warning("Skipping incomplete subject: %s", sid)
             continue
 
-        seg_path = _find_existing(_seg_candidates(subject_dir, sid))
+        data_list.append({"image": images, "label": str(seg)})
 
-        if require_label and seg_path is None:
-            logger.warning("Skipping %s: missing segmentation", sid)
+    if not data_list:
+        raise RuntimeError(
+            f"No valid BraTS subjects were found in {data_dir}. "
+            "Check the directory structure and file naming."
+        )
+
+    logger.info("Found %d subjects in %s", len(data_list), data_dir)
+    return data_list
+
+
+def build_test_file_list(test_dir: str) -> List[Dict[str, str]]:
+    test_dir = Path(test_dir)
+    if not test_dir.exists():
+        raise FileNotFoundError(f"Test data directory does not exist: {test_dir}")
+
+    data_list: List[Dict[str, str]] = []
+    for subject_dir in sorted(test_dir.iterdir()):
+        if not subject_dir.is_dir():
             continue
 
-        item: Dict[str, object] = {
-            "image": image_paths,
-            "case_id": sid,
-        }
+        sid = subject_dir.name
+        images: List[str] = []
+        missing = False
+        for modality in cfg.modalities:
+            path = _resolve_modality_path(subject_dir, sid, modality)
+            if path is None:
+                missing = True
+                logger.warning("Missing modality '%s' for test subject %s", modality, sid)
+                break
+            images.append(str(path))
 
-        if seg_path is not None:
-            item["label"] = str(seg_path)
+        if missing:
+            logger.warning("Skipping incomplete test subject: %s", sid)
+            continue
 
-        items.append(item)
+        data_list.append({"image": images, "subject_id": sid})
 
-    logger.info("Found %d subjects in %s", len(items), root)
-    return items
+    if not data_list:
+        raise RuntimeError(
+            f"No valid test subjects were found in {test_dir}. "
+            "Check the directory structure and file naming."
+        )
 
-
-def build_test_file_list(data_dir: str) -> List[Dict[str, object]]:
-    """
-    Compatibility wrapper expected by the repo.
-    Allows unlabeled test/inference folders.
-    """
-    return build_file_list(data_dir, require_label=False)
+    logger.info("Found %d test subjects in %s", len(data_list), test_dir)
+    return data_list
 
 
 def train_val_split(
-    data_list: List[Dict[str, object]],
-    val_ratio: Optional[float] = None,
-) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
-    if val_ratio is None:
-        val_ratio = _get_val_ratio()
+    data_list: List[Dict[str, str]],
+    val_ratio: float = 0.2,
+    seed: int = 42,
+) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
+    if len(data_list) < 2:
+        raise RuntimeError(
+            "At least 2 valid subjects are required for a train/validation split."
+        )
 
-    if len(data_list) == 0:
-        return [], []
+    rng = np.random.default_rng(seed)
+    idx = rng.permutation(len(data_list))
+    n_val = int(round(len(data_list) * val_ratio))
+    n_val = min(max(1, n_val), len(data_list) - 1)
 
-    split_idx = int(len(data_list) * (1.0 - float(val_ratio)))
-    split_idx = max(1, min(split_idx, len(data_list) - 1)) if len(data_list) > 1 else len(data_list)
-
-    train_files = data_list[:split_idx]
-    val_files = data_list[split_idx:]
-
-    return train_files, val_files
+    val_idx = idx[:n_val]
+    train_idx = idx[n_val:]
+    return [data_list[i] for i in train_idx], [data_list[i] for i in val_idx]
 
 
-# ---------------------------------------------------------------------
-# Transforms
-# ---------------------------------------------------------------------
+def _dataloader_kwargs(shuffle: bool) -> Dict:
+    kwargs = {
+        "num_workers": cfg.num_workers,
+        "pin_memory": True,
+    }
+    if cfg.num_workers > 0:
+        kwargs["persistent_workers"] = True
+    if shuffle:
+        kwargs["drop_last"] = False
+    return kwargs
 
-def get_train_transforms():
-    roi_size = _get_roi_size()
-    divisible_k = _get_divisible_k()
 
-    return Compose(
-        [
-            LoadImaged(keys=["image", "label"]),
-            EnsureChannelFirstd(keys=["image", "label"]),
-            Orientationd(keys=["image", "label"], axcodes="RAS"),
-            NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
-            Lambdad(keys="label", func=convert_brats_labels),
+def get_train_loader() -> DataLoader:
+    data_list = build_file_list(cfg.data_dir)
+    train_list, _ = train_val_split(data_list, cfg.val_ratio, cfg.seed)
+    logger.info("Train set size: %d", len(train_list))
 
-            # Make spatial sizes safe for encoder/decoder skip connections.
-            DivisiblePadd(keys=["image", "label"], k=divisible_k),
-
-            RandSpatialCropd(
-                keys=["image", "label"],
-                roi_size=roi_size,
-                random_size=False,
-            ),
-            RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
-            RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1),
-            RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=2),
-            RandScaleIntensityd(keys="image", factors=0.1, prob=0.5),
-            RandShiftIntensityd(keys="image", offsets=0.1, prob=0.5),
-            EnsureTyped(keys=["image", "label"]),
-        ]
+    ds = CacheDataset(
+        data=train_list,
+        transform=get_train_transforms(),
+        cache_rate=cfg.cache_rate,
+        num_workers=cfg.num_workers,
     )
-
-
-def get_val_transforms():
-    divisible_k = _get_divisible_k()
-
-    return Compose(
-        [
-            LoadImaged(keys=["image", "label"]),
-            EnsureChannelFirstd(keys=["image", "label"]),
-            Orientationd(keys=["image", "label"], axcodes="RAS"),
-            NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
-            Lambdad(keys="label", func=convert_brats_labels),
-
-            # Critical fix for validation/inference shape mismatch.
-            DivisiblePadd(keys=["image", "label"], k=divisible_k),
-
-            EnsureTyped(keys=["image", "label"]),
-        ]
-    )
-
-
-def get_test_transforms():
-    divisible_k = _get_divisible_k()
-
-    return Compose(
-        [
-            LoadImaged(keys=["image"]),
-            EnsureChannelFirstd(keys=["image"]),
-            Orientationd(keys=["image"], axcodes="RAS"),
-            NormalizeIntensityd(keys="image", nonzero=True, channel_wise=True),
-            DivisiblePadd(keys=["image"], k=divisible_k),
-            EnsureTyped(keys=["image"]),
-        ]
-    )
-
-
-# ---------------------------------------------------------------------
-# Loaders
-# ---------------------------------------------------------------------
-
-def get_train_loader():
-    data_list = build_file_list(cfg.data_dir, require_label=True)
-    train_files, _ = train_val_split(data_list)
-
-    logger.info("Train set size: %d", len(train_files))
-
-    ds = Dataset(data=train_files, transform=get_train_transforms())
-    loader = DataLoader(
+    return DataLoader(
         ds,
-        batch_size=_get_batch_size(),
+        batch_size=cfg.batch_size,
         shuffle=True,
-        num_workers=_get_num_workers(),
-        pin_memory=torch.cuda.is_available(),
-        drop_last=True,
+        **_dataloader_kwargs(shuffle=True),
     )
-    return loader
 
 
-def get_val_loader():
-    data_list = build_file_list(cfg.data_dir, require_label=True)
-    _, val_files = train_val_split(data_list)
+def get_val_loader() -> DataLoader:
+    data_list = build_file_list(cfg.data_dir)
+    _, val_list = train_val_split(data_list, cfg.val_ratio, cfg.seed)
+    logger.info("Val set size: %d", len(val_list))
 
-    logger.info("Val set size: %d", len(val_files))
-
-    ds = Dataset(data=val_files, transform=get_val_transforms())
-    loader = DataLoader(
+    ds = Dataset(data=val_list, transform=get_val_transforms())
+    return DataLoader(
         ds,
         batch_size=1,
         shuffle=False,
-        num_workers=_get_num_workers(),
-        pin_memory=torch.cuda.is_available(),
-        drop_last=False,
+        **_dataloader_kwargs(shuffle=False),
     )
-    return loader
 
 
-def get_test_loader(data_dir: Optional[str] = None):
-    if data_dir is None:
-        data_dir = cfg.data_dir
-
-    test_files = build_test_file_list(data_dir)
-
-    logger.info("Test set size: %d", len(test_files))
-
-    ds = Dataset(data=test_files, transform=get_test_transforms())
-    loader = DataLoader(
+def get_test_loader(test_dir: str) -> DataLoader:
+    data_list = build_test_file_list(test_dir)
+    ds = Dataset(data=data_list, transform=get_inference_transforms())
+    return DataLoader(
         ds,
-        batch_size=1,
+        batch_size=cfg.infer_batch_size,
         shuffle=False,
-        num_workers=_get_num_workers(),
-        pin_memory=torch.cuda.is_available(),
-        drop_last=False,
+        **_dataloader_kwargs(shuffle=False),
     )
-    return loader
