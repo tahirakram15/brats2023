@@ -25,8 +25,8 @@ class Config:
 
     # ── Training ───────────────────────────────────────────────────────────
     seed: int = 42
-    num_workers: int = 4
-    batch_size: int = 1           # 3-D patches — keep at 1 unless large GPU
+    num_workers: int = 2
+    batch_size: int = 2           # 3-D patches — keep at 1 unless large GPU
     cache_rate: float = 0.0       # increase if RAM allows (e.g. 0.5)
     max_epochs: int = 300
     val_every: int = 5
