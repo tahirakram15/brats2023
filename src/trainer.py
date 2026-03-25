@@ -14,6 +14,7 @@ import json
 import logging
 import os
 from typing import Dict
+import numpy as np
 
 import torch
 from monai.data import decollate_batch
@@ -26,7 +27,7 @@ from src.config import cfg
 from src.data.dataset import get_train_loader, get_val_loader
 from src.losses.losses import BraTSLoss
 from src.models import build_model
-from src.utils import build_metrics
+from src.utils import build_metrics, metrics
 
 logger = logging.getLogger(__name__)
 
@@ -92,44 +93,98 @@ class Trainer:
 
         return epoch_loss / max(step, 1)
 
-    # ─────────────────────────────────────────────────────────────────────
-    def _validate(self) -> Dict[str, float]:
+    def _validate(self):
+   
         self.model.eval()
         self.dice_metric.reset()
-        self.hd95_metric.reset()
+
+        val_loss = 0.0
+        num_batches = 0
 
         with torch.no_grad():
             for batch in self.val_loader:
                 images = batch["image"].to(self.device)
                 labels = batch["label"].to(self.device)
 
-                outputs = sliding_window_inference(
-                    inputs=images,
-                    roi_size=cfg.roi_size,
-                    sw_batch_size=cfg.sw_batch_size,
-                    predictor=self.model,
-                    overlap=cfg.overlap,
-                )
+                # forward
+                outputs = self.model(images)
 
-                preds = [self.post_trans(o) for o in decollate_batch(outputs)]
-                gts = decollate_batch(labels)
+                # loss
+                loss = self.loss_fn(outputs, labels)
+                val_loss += loss.item()
+                num_batches += 1
 
-                self.dice_metric(y_pred=preds, y=gts)
-                self.hd95_metric(y_pred=preds, y=gts)
+                # BraTS here is multilabel region prediction, so use sigmoid
+                probs = torch.sigmoid(outputs)
+                preds = (probs > 0.5).float()
 
-        mean_dice = self.dice_metric.aggregate().item()
-        per_region = (
-            self.dice_metric.aggregate(reduction=None).cpu().numpy()[0]
-        )
-        hd95 = self.hd95_metric.aggregate().item()
+            # update MONAI dice metric
+                self.dice_metric(y_pred=preds, y=labels)
 
-        return {
-            "mean_dice": mean_dice,
+    # mean validation loss
+        mean_val_loss = val_loss / max(1, num_batches)
+
+            # aggregate mean dice
+        dice_mean = self.dice_metric.aggregate()
+        if isinstance(dice_mean, torch.Tensor):
+            dice_mean = float(dice_mean.detach().cpu().item())
+        else:
+            dice_mean = float(dice_mean)
+
+        # aggregate per-region dice safely
+        per_region = self.dice_metric.aggregate(reduction=None)
+
+        if isinstance(per_region, torch.Tensor):
+            per_region = per_region.detach().cpu().numpy()
+        else:
+            per_region = np.asarray(per_region)
+
+        # Robust handling for different MONAI output shapes
+        # Possible cases:
+        # scalar
+        # (3,)
+        # (N,3)
+        # (1,3)
+        # weird flattened forms
+        if per_region.ndim == 0:
+            per_region = np.array([float(per_region)] * 3, dtype=np.float32)
+
+        elif per_region.ndim == 1:
+            if per_region.shape[0] == 1:
+                per_region = np.array([float(per_region[0])] * 3, dtype=np.float32)
+            elif per_region.shape[0] < 3:
+                padded = np.zeros(3, dtype=np.float32)
+                padded[:per_region.shape[0]] = per_region
+                per_region = padded
+            else:
+                per_region = per_region[:3].astype(np.float32)
+
+        else:
+            # e.g. (num_cases, 3) or (1, 3)
+            per_region = np.asarray(per_region, dtype=np.float32)
+            per_region = per_region.reshape(-1, per_region.shape[-1]).mean(axis=0)
+
+            if per_region.shape[0] < 3:
+                padded = np.zeros(3, dtype=np.float32)
+                padded[:per_region.shape[0]] = per_region
+                per_region = padded
+            else:
+                per_region = per_region[:3].astype(np.float32)
+
+        metrics = {
+            "val_loss": float(mean_val_loss),
+            "dice": float(dice_mean),
             "dice_tc": float(per_region[0]),
             "dice_wt": float(per_region[1]),
             "dice_et": float(per_region[2]),
-            "hd95": hd95,
         }
+
+        self.dice_metric.reset()
+        self.model.train()
+
+        return metrics
+
+    # ─────────────────────────────────────────────────────────────────────
 
     # ─────────────────────────────────────────────────────────────────────
     def _save_checkpoint(self, epoch: int, metrics: Dict):
