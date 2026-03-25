@@ -198,7 +198,6 @@ def get_val_loader():
 def build_test_file_list(data_dir: str):
     return build_file_list(data_dir)
 
-
 def train_val_split(data_list, val_ratio=0.2):
     split_idx = int(len(data_list) * (1 - val_ratio))
     train_files = data_list[:split_idx]
