@@ -23,7 +23,7 @@ class Config:
 
     # Training
     seed: int = 42
-    num_workers: int = 2
+    num_workers: int = 0
     batch_size: int = 2
     cache_rate: float = 0.0
     max_epochs: int = 300

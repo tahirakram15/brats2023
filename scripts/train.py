@@ -17,6 +17,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.config import cfg
 from src.trainer import Trainer
+import torch.multiprocessing as mp
+mp.set_sharing_strategy("file_system")
 
 logging.basicConfig(
     level=logging.INFO,

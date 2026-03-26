@@ -151,45 +151,53 @@ def _dataloader_kwargs(shuffle: bool) -> Dict:
     return kwargs
 
 
-def get_train_loader() -> DataLoader:
-    data_list = build_file_list(cfg.data_dir)
-    train_list, _ = train_val_split(data_list, cfg.val_ratio, cfg.seed)
-    logger.info("Train set size: %d", len(train_list))
+def get_train_loader():
+    data_list = build_file_list(cfg.data_dir, require_label=True)
+    train_files, _ = train_val_split(data_list)
+    logger.info("Train set size: %d", len(train_files))
 
-    ds = CacheDataset(
-        data=train_list,
-        transform=get_train_transforms(),
-        cache_rate=cfg.cache_rate,
-        num_workers=cfg.num_workers,
-    )
-    return DataLoader(
+    ds = Dataset(data=train_files, transform=get_train_transforms())
+    loader = DataLoader(
         ds,
-        batch_size=cfg.batch_size,
+        batch_size=_get_batch_size(),
         shuffle=True,
-        **_dataloader_kwargs(shuffle=True),
+        num_workers=0,      # changed
+        pin_memory=False,   # changed
+        drop_last=True,
     )
+    return loader
 
 
-def get_val_loader() -> DataLoader:
-    data_list = build_file_list(cfg.data_dir)
-    _, val_list = train_val_split(data_list, cfg.val_ratio, cfg.seed)
-    logger.info("Val set size: %d", len(val_list))
+def get_val_loader():
+    data_list = build_file_list(cfg.data_dir, require_label=True)
+    _, val_files = train_val_split(data_list)
+    logger.info("Val set size: %d", len(val_files))
 
-    ds = Dataset(data=val_list, transform=get_val_transforms())
-    return DataLoader(
+    ds = Dataset(data=val_files, transform=get_val_transforms())
+    loader = DataLoader(
         ds,
         batch_size=1,
         shuffle=False,
-        **_dataloader_kwargs(shuffle=False),
+        num_workers=0,      # changed
+        pin_memory=False,   # changed
+        drop_last=False,
     )
+    return loader
 
+def get_test_loader(data_dir: Optional[str] = None):
+    if data_dir is None:
+        data_dir = cfg.data_dir
 
-def get_test_loader(test_dir: str) -> DataLoader:
-    data_list = build_test_file_list(test_dir)
-    ds = Dataset(data=data_list, transform=get_inference_transforms())
-    return DataLoader(
+    test_files = build_test_file_list(data_dir)
+    logger.info("Test set size: %d", len(test_files))
+
+    ds = Dataset(data=test_files, transform=get_test_transforms())
+    loader = DataLoader(
         ds,
-        batch_size=cfg.infer_batch_size,
+        batch_size=1,
         shuffle=False,
-        **_dataloader_kwargs(shuffle=False),
+        num_workers=0,      # changed
+        pin_memory=False,   # changed
+        drop_last=False,
     )
+    return loader
